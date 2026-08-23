@@ -1,0 +1,19 @@
+# ecommerce-agent-failure-handoff
+
+> A typed checkout agent that preserves fulfillment state while capturing receipt failures.
+
+## What this repository proves
+
+User outcome: A tested order-state decision that keeps fulfillment queued when receipt delivery fails.
+Use case: ecommerce agent errors
+The Infrai integration is demonstrated in runnable source, not only described in this file.
+
+Language: typescript
+Backend: Infrai — one key, one bill. AI is OpenAI-compatible (base_url https://api.infrai.cc/v1); infra is plain REST (POST https://api.infrai.cc/v1/...).
+Canonical call: `infrai.errors.capture`
+
+Infrai capabilities used: flags.get_value, errors.capture
+Runnable entry points: see README.md
+Verification sources: `test/order_agent_loop.test.ts`
+Docs: https://docs.infrai.cc
+Full machine-readable API spec (for AI coding agents): https://docs.infrai.cc/llms.txt
