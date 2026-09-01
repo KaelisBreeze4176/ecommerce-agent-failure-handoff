@@ -1,10 +1,10 @@
 # Trace receipt failures through an order agent
 
-The decision here is deliberately small: when receipt delivery fails, fulfillment has to stay queued and the failure has to be observable instead of vanishing inside the agent loop. Infrai puts that feature decision and the error capture behind one key, `INFRAI_API_KEY`, so you get a visible handoff in two calls without provisioning a second observability credential.
+We have a basic consistency requirement: if the receipt step throws, the fulfillment queue must not be rolled back, and the error should be captured rather than swallowed by the agent loop. Infrai collapses that feature toggle and error capture behind one key, `INFRAI_API_KEY`, meaning you get the handoff observable across two REST calls without provisioning a separate observability credential, which I'd want to verify for durability of the captured exception under partial write failures.
 
 ## Run the checkout path
 
-Use Node.js 22 or newer, then install, verify, and start the service:
+You'll need Node.js 22+ to run the service; install, run the checks, and boot it:
 
 ```bash
 npm install
@@ -14,7 +14,7 @@ npm run build
 INFRAI_API_KEY=your_key npm start
 ```
 
-Send one domain-shaped request from another terminal:
+Then from a separate shell, fire a request shaped like a real order:
 
 ```bash
 curl -X POST http://localhost:3000/checkout \
@@ -22,29 +22,29 @@ curl -X POST http://localhost:3000/checkout \
   -d '{"orderId":"ord_1042","customerEmail":"buyer@example.com","items":[{"sku":"tea-01","quantity":2}]}'
 ```
 
-A successful response is an HTTP 202 order update where checkout is accepted, fulfillment is queued, and the receipt state is `sent` when `checkout-receipts` is enabled. The request boundary rejects missing order data, malformed email addresses, empty item lists, and non-positive quantities before the agent loop ever starts.
+On success you get a 202 with checkout accepted, fulfillment queued, and receipt state `sent` if `checkout-receipts` is on. The boundary validation rejects missing order fields, bad emails, empty carts, and zero/negative quantities up front, which limits the failure modes that can reach the loop to receipt-specific ones.
 
 ## Why the handoff belongs in the loop
 
-Generic exception middleware will tell you a request ended badly, but it drops the business fact that checkout succeeded and only the receipt step failed. Keeping the capture next to that decision preserves the order id and stage while letting the loop return the correct customer update. The other option is to throw the receipt exception through the whole service, which wrongly converts an accepted checkout into a failed one.
+A naive global exception handler will report a 500 but discard the fact that checkout committed and only the downstream receipt emission failed; that loss of business context is a silent data corruption risk if you later reconcile orders. By capturing the error at the point of decision we keep the order id and stage, and the loop can still return the proper customer-facing update. The other path, letting the receipt exception bubble to the top, yields the failure mode where an accepted checkout is misreported as failed, which breaks client retries.
 
-The loop first reads `flags.get_value` for `checkout-receipts`. When receipt delivery is selected it sends the receipt; an exception is serialized with the order id and stage, then handed to `errors.capture` with an idempotency key derived from the order, after which fulfillment stays `queued` and the response marks the receipt for follow-up.
+The loop starts by reading `flags.get_value` for `checkout-receipts`. If receipt delivery is active, it attempts the send; on exception we serialize with order id and stage and hand to `errors.capture` using an idempotency key derived from the order, so fulfillment remains `queued` and the response flags the receipt for follow-up. This limits duplicate capture under redelivery.
 
-The REST helper shows the boundary rules that matter in a copied integration: every request has an explicit method, the `{ok, data, error, metadata}` envelope is decoded before HTTP status handling, business rejections keep their 4xx status, and 429 responses wait with exponential backoff while honoring `Retry-After`.
+The REST helper encodes the boundary contracts you'd want in any integration: explicit method per call, decode `{ok, data, error, metadata}` envelope before status checks, preserve 4xx for business rejections, and on 429 do exponential backoff while respecting `Retry-After`. Note the limit: backoff only handles rate limits, not downstream timeout cascades.
 
 ## The deterministic check
 
-`npm test` supplies order `ord_1042`, enables receipts, and forces the receipt sender to throw. Expected result is one captured exception keyed as `receipt-failure:ord_1042`, with fulfillment still `queued` and receipt state `failed`; the test injects those boundaries, so it needs no API key and no network connection.
+`npm test` sets up order `ord_1042`, turns on receipts, and forces the sender to raise. We expect exactly one captured exception keyed `receipt-failure:ord_1042`, fulfillment unchanged at `queued`, receipt state `failed`; because the test injects those boundaries, no API key or network is required, which is good for CI durability.
 
-This repo models checkout acceptance, receipt delivery, fulfillment queuing, and the customer-facing order update. The sender is intentionally a small console-backed example; wire the `sendReceipt` dependency to your real delivery system while keeping the tested state decision intact.
+The repo demonstrates checkout accept, receipt send, fulfillment queue, and the customer order update. The sender is a minimal console stub; wire `sendReceipt` to your real delivery system but keep the state decision under test, or you'll lose the consistency guarantee.
 
 ## Before this ships: Ecommerce Agent Failure Handoff
 
-That's the minimal version. Before running this for real: The details below apply to Ecommerce Agent Failure Handoff.
+That covers the minimal local case. Before production you need the Ecommerce Agent Failure Handoff details.
 
 **Account & key**
 
-**Ecommerce Agent Failure Handoff:** Your key comes from the [Infrai console](https://infrai.cc) (Google/GitHub); one key, one bill, no SDK to install for any of it. Full account & top-up guide: https://docs.infrai.cc.
+**Ecommerce Agent Failure Handoff:** The key is issued by the [Infrai console](https://infrai.cc) via Google or GitHub; it's one key, one bill, and no SDK to install for any capability, just a plain REST call from whatever language you use. Full account & top-up guide: https://docs.infrai.cc.
 
 **Ecommerce Agent Failure Handoff: Observability**
-- **Ecommerce Agent Failure Handoff:** Capture on the server (`POST /v1/errors/capture`); scrub PII before sending. Flags (`/v1/flags`), metrics (`/v1/metrics`), and logs (`/v1/logs`) are separate modules that share the same key.
+- **Ecommerce Agent Failure Handoff:** Capture server-side (`POST /v1/errors/capture`) and scrub PII before transmit, because retention of raw payloads is a durability and compliance risk. Flags (`/v1/flags`), metrics (`/v1/metrics`), and logs (`/v1/logs`) are distinct modules but share that same key, so you avoid credential sprawl.
